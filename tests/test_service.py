@@ -1,6 +1,7 @@
 """End-to-end tests for the HMM decoding service (via the HTTP layer)."""
 
 import copy
+import itertools
 import math
 from concurrent.futures import ThreadPoolExecutor
 
@@ -379,3 +380,68 @@ def test_parallel_decode_of_two_models_does_not_cross_write(app):
     for r in results_b:
         assert r == baseline_b
         assert r["model"] == DEMO_MODEL["name"]
+
+
+# ------------------------------------------------------- posterior correctness
+
+def asymmetric_model(name="asym"):
+    """Directional chain: 'stay' clings to itself, 'drift' flows back into
+    'stay' far more readily than 'stay' enters 'drift' -- the transition
+    matrix is deliberately far from symmetric."""
+    return {
+        "name": name,
+        "states": ["stay", "drift"],
+        "alphabet": ["a", "b"],
+        "initial": [0.5, 0.5],
+        "transition": [[0.95, 0.05], [0.60, 0.40]],
+        "emission": [[0.9, 0.1], [0.2, 0.8]],
+    }
+
+
+def posteriors_by_enumeration(spec, observations):
+    """Reference posterior computed straight from the definition: enumerate
+    every state path, score it, and sum path masses per (time, state).
+    Exponential in the sequence length -- only for short test sequences."""
+    states = spec["states"]
+    alpha = spec["alphabet"]
+    obs_idx = [alpha.index(s) for s in observations]
+    n = len(states)
+
+    totals = [[0.0] * n for _ in obs_idx]
+    total_mass = 0.0
+    for path in itertools.product(range(n), repeat=len(obs_idx)):
+        mass = spec["initial"][path[0]] * spec["emission"][path[0]][obs_idx[0]]
+        for t in range(1, len(obs_idx)):
+            mass *= spec["transition"][path[t - 1]][path[t]]
+            mass *= spec["emission"][path[t]][obs_idx[t]]
+        total_mass += mass
+        for t, state in enumerate(path):
+            totals[t][state] += mass
+    return [[totals[t][i] / total_mass for i in range(n)] for t in range(len(obs_idx))]
+
+
+@pytest.mark.parametrize("obs", ["abba", "aabbaabb", "bababab", "abbbba"])
+def test_posteriors_match_brute_force_enumeration_with_asymmetric_transitions(client, obs):
+    """With an asymmetric transition matrix the backward recursion must use
+    A[i][j] (current -> next); a transposed index still yields rows summing
+    to 1 and a correct final time step, so only a per-time-step comparison
+    against an independent enumeration catches it -- especially mid-sequence."""
+    spec = asymmetric_model()
+    register(client, spec)
+    resp = decode(client, spec["name"], list(obs))
+    assert resp.status_code == 200
+    got = resp.get_json()["posteriors"]
+
+    want = posteriors_by_enumeration(spec, list(obs))
+    assert len(got) == len(want)
+    for t, (got_row, want_row) in enumerate(zip(got, want)):
+        for state, expected in zip(spec["states"], want_row):
+            assert got_row[state] == pytest.approx(expected, abs=1e-9), (
+                f"t={t} state={state}: service={got_row[state]}, "
+                f"enumeration={expected}"
+            )
+        # The middle time steps are where the transposed-transition bug
+        # showed up; make the intent explicit rather than relying on the
+        # loop above alone.
+        if 0 < t < len(obs) - 1:
+            assert got_row["stay"] == pytest.approx(want_row[0], abs=1e-9)

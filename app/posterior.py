@@ -35,12 +35,14 @@ def forward_backward(log_initial, log_transition, log_emission, obs_indices):
 
     # Backward: beta[t][i] = P(o_{t+1}..o_{T-1} | state_t = i), in log space.
     # The last row is the log-domain unit value, log(1) = 0.
+    # The transition factor is A[i][j] (current state i -> next state j),
+    # the same orientation used by the forward pass and Viterbi.
     log_beta = [[0.0] * n_states for _ in range(n_obs)]
     for t in range(n_obs - 2, -1, -1):
         nxt = obs_indices[t + 1]
         for i in range(n_states):
             log_beta[t][i] = logsumexp(
-                log_transition[j][i] + log_emission[j][nxt] + log_beta[t + 1][j]
+                log_transition[i][j] + log_emission[j][nxt] + log_beta[t + 1][j]
                 for j in range(n_states)
             )
 
