@@ -35,12 +35,16 @@ def forward_backward(log_initial, log_transition, log_emission, obs_indices):
 
     # Backward: beta[t][i] = P(o_{t+1}..o_{T-1} | state_t = i), in log space.
     # The last row is the log-domain unit value, log(1) = 0.
+    # beta[t][i] = sum_j T[i->j] * emission[j][o_{t+1}] * beta[t+1][j];
+    # note the transition is indexed [i][j] (from current state i to
+    # successor j) -- transposing it to [j][i] silently corrupts every row
+    # except the last whenever the transition matrix is asymmetric.
     log_beta = [[0.0] * n_states for _ in range(n_obs)]
     for t in range(n_obs - 2, -1, -1):
         nxt = obs_indices[t + 1]
         for i in range(n_states):
             log_beta[t][i] = logsumexp(
-                log_transition[j][i] + log_emission[j][nxt] + log_beta[t + 1][j]
+                log_transition[i][j] + log_emission[j][nxt] + log_beta[t + 1][j]
                 for j in range(n_states)
             )
 

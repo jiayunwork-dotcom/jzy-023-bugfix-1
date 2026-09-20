@@ -1,6 +1,7 @@
 """End-to-end tests for the HMM decoding service (via the HTTP layer)."""
 
 import copy
+import itertools
 import math
 from concurrent.futures import ThreadPoolExecutor
 
@@ -83,6 +84,110 @@ def test_posterior_argmax_is_not_the_viterbi_path(client):
     # argmax never selects the transit state.
     assert "transit" in data["path"]
     assert "transit" not in posterior_argmax
+
+
+def _enumerated_posteriors(spec, obs_symbols):
+    """Independent reference implementation straight from the definition:
+    enumerate every state path, weight it by the raw (linear-domain) joint
+    probability, and sum the weights of the paths landing in each state at
+    each time step. Also returns the log evidence log P(observations)."""
+    states = spec["states"]
+    alphabet = spec["alphabet"]
+    n_states, n_obs = len(states), len(obs_symbols)
+    obs = [alphabet.index(symbol) for symbol in obs_symbols]
+
+    marginals = [[0.0] * n_states for _ in range(n_obs)]
+    evidence = 0.0
+    for path in itertools.product(range(n_states), repeat=n_obs):
+        weight = spec["initial"][path[0]] * spec["emission"][path[0]][obs[0]]
+        for t in range(1, n_obs):
+            weight *= spec["transition"][path[t - 1]][path[t]]
+            weight *= spec["emission"][path[t]][obs[t]]
+        evidence += weight
+        for t, state in enumerate(path):
+            marginals[t][state] += weight
+    posteriors = [[m / evidence for m in row] for row in marginals]
+    return posteriors, math.log(evidence)
+
+
+@pytest.mark.parametrize("word", ["abba", "abbab"])
+def test_posteriors_match_path_enumeration_for_asymmetric_transition(client, word):
+    """Asymmetric transitions (state 0 is sticky, state 1 tends to flow
+    back into state 0) plus switching observations expose a transposed
+    transition matrix in the backward pass: the final row still matches by
+    construction, but middle rows drift and even flip which state dominates.
+    Compare against posteriors computed by independently enumerating every
+    state path, with the middle time steps under special scrutiny."""
+    spec = {
+        "name": "asymmetric",
+        "states": ["sticky", "drifter"],
+        "alphabet": ["a", "b"],
+        "initial": [0.5, 0.5],
+        # sticky keeps to itself (0.9); drifter flows back to sticky (0.3)
+        # much more than sticky flows to drifter (0.1) -- clearly asymmetric.
+        "transition": [[0.9, 0.1], [0.3, 0.7]],
+        "emission": [[0.8, 0.2], [0.2, 0.8]],
+    }
+    assert any(
+        spec["transition"][i][j] != spec["transition"][j][i]
+        for i in range(2)
+        for j in range(2)
+    )
+    register(client, spec)
+
+    observations = list(word)
+    resp = decode(client, "asymmetric", observations)
+    assert resp.status_code == 200
+    data = resp.get_json()
+
+    expected, expected_loglik = _enumerated_posteriors(spec, observations)
+    states = spec["states"]
+
+    # Every time step, including all interior ones, must match the
+    # definition -- row sums alone would not catch this regression.
+    assert len(data["posteriors"]) == len(observations)
+    for t, (served_row, expected_row) in enumerate(
+        zip(data["posteriors"], expected)
+    ):
+        for i, state in enumerate(states):
+            assert served_row[state] == pytest.approx(expected_row[i], abs=1e-12), (
+                f"posterior mismatch at t={t}, state={state!r}: "
+                f"served {served_row[state]!r} vs enumerated {expected_row[i]!r}"
+            )
+
+    # Under the transposed-backward bug the interior rows of "abba"/"abbab"
+    # name 'sticky' as the winner at t=1/t=2 where the definition says
+    # 'drifter' is more probable. Pin the ordering at every middle time
+    # step against the enumerated reference (later middle steps, e.g. the
+    # 'a' in "abbab", may legitimately favor 'sticky' -- the point is that
+    # the service must say exactly what the enumeration says), and require
+    # that at least one interior step genuinely favors 'drifter' so this
+    # ordering guard has teeth.
+    middle = range(1, len(observations) - 1)
+    assert any(expected[t][1] > 0.5 for t in middle)
+    for t in middle:
+        served_argmax = max(data["posteriors"][t], key=data["posteriors"][t].get)
+        expected_argmax = states[max(range(len(states)), key=lambda i: expected[t][i])]
+        assert served_argmax == expected_argmax, (
+            f"dominant state flipped at t={t}: served {served_argmax!r} "
+            f"vs enumerated {expected_argmax!r}"
+        )
+
+    # The evidence synthesized by forward-backward must agree as well.
+    assert data["log_likelihood"] == pytest.approx(expected_loglik, abs=1e-12)
+    # Viterbi outputs are untouched by this fix: still internally consistent.
+    logp = math.log(spec["initial"][states.index(data["path"][0])])
+    for t, symbol in enumerate(observations):
+        logp += math.log(
+            spec["emission"][states.index(data["path"][t])][spec["alphabet"].index(symbol)]
+        )
+        if t > 0:
+            logp += math.log(
+                spec["transition"][states.index(data["path"][t - 1])][
+                    states.index(data["path"][t])
+                ]
+            )
+    assert data["log_probability"] == pytest.approx(logp, abs=1e-12)
 
 
 def test_decode_response_shape_and_tie_break_rule(client):
